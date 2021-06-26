@@ -39,11 +39,12 @@ class SimpleA2C(nn.Module):
         self.value_out = nn.Linear(256, 1)
 
         # Track stuff for updates
-        # Hopefully 10000 is enough here
-        self.buffer_max = 10000
-        self.epi_obs_pov = torch.zeros((self.buffer_max,) + self.pov_shape, device=self.device)
-        self.epi_obs_inv = torch.zeros(self.buffer_max, self.inventory_shape, device=self.device)
-        self.epi_obs_comp = torch.zeros(self.buffer_max, self.inventory_shape, device=self.device)
+        # Hopefully 6000 is enough here
+        self.buffer_max = 8
+        # Obs buffer is +1 bigger to store next obs for value bootstrapping
+        self.epi_obs_pov = torch.zeros((self.buffer_max+1,) + self.pov_shape, device=self.device)
+        self.epi_obs_inv = torch.zeros(self.buffer_max+1, self.inventory_shape, device=self.device)
+        self.epi_obs_comp = torch.zeros(self.buffer_max+1, self.inventory_shape, device=self.device)
         self.epi_rew = torch.zeros(self.buffer_max, 1, device=self.device)
         self.epi_acts = torch.zeros(self.buffer_max, 11, device=self.device)
         self.epi_ind = 0
@@ -78,15 +79,16 @@ class SimpleA2C(nn.Module):
 
         camera_x = camera_x_dist.sample()
         camera_y = camera_y_dist.sample()
+
         # TODO handle wrap around
-        camera_x = (camera_x * 180).clamp(-180, 180)
-        camera_y = (camera_y * 180).clamp(-180, 180)
+        camera_x = (camera_x * 22.5).clamp(-180, 180)
+        camera_y = (camera_y * 22.5).clamp(-180, 180)
 
         # Assemble the action dict
         action_dict = self.action_template
         action_dict['attack'] = attack_dist.sample()
         action_dict['back'] = back_dist.sample()
-        action_dict['camera'] = [camera_x, camera_y]
+        action_dict['camera'] = [camera_x.item(), camera_y.item()]
         action_dict['forward'] = forward_dist.sample()
         action_dict['jump'] = jump_dist.sample()
         action_dict['left'] = left_dist.sample()
@@ -97,7 +99,7 @@ class SimpleA2C(nn.Module):
         return action_dict
 
     # Update agent
-    def update(self, obs, action, reward, done):
+    def update(self, obs, action, reward, done, next_obs):
 
         pov, comp, inv = convert_obs(obs, self.device)
         self.epi_obs_pov[self.epi_ind] = pov
@@ -106,33 +108,50 @@ class SimpleA2C(nn.Module):
         self.epi_rew[self.epi_ind] = reward
         self.epi_acts[self.epi_ind] = convert_action_dict_to_vec(action)
         self.epi_ind += 1
+        # Store next obs
+        pov, comp, inv = convert_obs(next_obs, self.device)
+        self.epi_obs_pov[self.epi_ind] = pov
+        self.epi_obs_inv[self.epi_ind] = comp
+        self.epi_obs_comp[self.epi_ind] = inv
 
+        total_loss = 0
+        value_loss = 0
+        entropy = 0
         # Actually perform an update
         if done or self.epi_ind == self.buffer_max:
+
+            # Get dists and compute log probs
+            act_logits, values = self.forward(self.epi_obs_pov[:self.epi_ind+1], self.epi_obs_comp[:self.epi_ind+1],
+                                              self.epi_obs_inv[:self.epi_ind+1])
+            # Don't use logits for final observation (just for bootstrapping)
+            act_logits = act_logits[:self.epi_ind]
+
             # Accumulate rewards
             returns = torch.zeros_like(self.epi_rew)
             for r in range(self.epi_ind - 1, 0, -1):
-                returns[r] = self.epi_rew[r] + self.gamma * returns[min(r+1, self.buffer_max-1)]
-            # Get dists and compute log probs
-            act_logits, values = self.forward(self.epi_obs_pov[:self.epi_ind], self.epi_obs_comp[:self.epi_ind],
-                                              self.epi_obs_inv[:self.epi_ind])
+                returns[r] = self.epi_rew[r] + self.gamma * 0.95 * returns[min(r+1, self.buffer_max-1)] + \
+                            (self.gamma * values[r+1].detach() - values[r])
+
             dists = get_dists(act_logits)
-            advantages = returns[:self.epi_ind] - values
+            advantages = returns[:self.epi_ind] # - values
+
             # Compute updates for each component of the action separately
             self.opt.zero_grad()
-            total_loss = 0
             for dist_n in range(len(dists)):
                 log_probs = dists[dist_n].log_prob(self.epi_acts[:self.epi_ind, dist_n])
+                entropy += dists[dist_n].entropy().mean()
                 losses = -log_probs * advantages.detach()
                 loss = losses.mean()
                 total_loss += loss
                 #loss.backward(retain_graph=True)
 
+            total_loss /= len(dists)
+            entropy /= len(dists)
+
             value_loss = advantages.pow(2).mean()
 
-            (total_loss + value_loss).backward()
+            (total_loss + value_loss + 0.01 * -entropy).backward()
             self.opt.step()
-            print(total_loss, value_loss)
 
             # Cleanup
             self.epi_ind = 0
@@ -141,3 +160,5 @@ class SimpleA2C(nn.Module):
             self.epi_obs_inv = torch.zeros_like(self.epi_obs_inv)
             self.epi_rew = torch.zeros_like(self.epi_rew)
             self.epi_acts = torch.zeros_like(self.epi_acts)
+
+        return total_loss, value_loss, entropy
